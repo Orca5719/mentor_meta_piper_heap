@@ -453,6 +453,53 @@ class MENTORAgent:
 
         return metrics
 
+    def update_bc(self, replay_iter, bc_loss_type='mse'):
+        """Behavior Cloning update: supervise actor with demo actions.
+
+        Only updates encoder + actor (critic/vpredictor stay unchanged).
+        Called during BC pretraining phase before RL fine-tuning.
+
+        Args:
+            replay_iter: iterator over replay buffer batches
+            bc_loss_type: 'mse' (mean squared error on mean action) or
+                          'nll' (negative log-likelihood under policy)
+        """
+        metrics = dict()
+
+        batch = next(replay_iter)
+        obs, action, reward, discount, next_obs, is_intervened = utils.to_torch(batch, self.device)
+
+        # augment + encode
+        obs = self.aug(obs.float())
+        obs = self.encoder(obs)
+
+        # get policy distribution
+        dist, aux_loss = self.actor(obs, self.stddev(0))
+
+        if bc_loss_type == 'nll':
+            # Negative log-likelihood of expert action under policy
+            bc_loss = -dist.log_prob(action).sum(-1).mean()
+        else:
+            # MSE between policy mean and expert action
+            bc_loss = F.mse_loss(dist.mean, action)
+
+        # optimize encoder + actor
+        self.encoder_opt.zero_grad(set_to_none=True)
+        self.actor_opt.zero_grad(set_to_none=True)
+        (bc_loss + aux_loss).backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.encoder.parameters()) + list(self.actor.parameters()), 1.0
+        )
+        self.encoder_opt.step()
+        self.actor_opt.step()
+
+        if self.use_tb:
+            metrics['bc_loss'] = bc_loss.item()
+            metrics['bc_aux_loss'] = aux_loss.item()
+            metrics['bc_action_error'] = F.mse_loss(dist.mean, action).item()
+
+        return metrics
+
     def perturb(self):
         utils.perturb(self.actor, self.actor_opt, self.perturb_factor(), tp_set=self.tp_set, name="actor")
         # utils.perturb(self.actor.moe.experts, self.actor_opt, self.perturb_factor(), tp_set=self.tp_set, name="actor_moe_expert")
