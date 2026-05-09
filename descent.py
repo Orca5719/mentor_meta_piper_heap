@@ -371,9 +371,9 @@ class PiperRobotTrainer:
                 gripper_ctrl = 1.0 if self.gripper_open else -1.0
 
             override_action = np.array([
-                dx * self.SPACE_MOUSE_ACTION_SCALE,
-                dy * self.SPACE_MOUSE_ACTION_SCALE,
-                dz * self.SPACE_MOUSE_ACTION_SCALE,
+                dx,
+                dy,
+                dz,
                 gripper_ctrl
             ], dtype=self._act_spec.dtype)
             override_action = np.clip(override_action, self._act_spec.minimum, self._act_spec.maximum)
@@ -620,11 +620,28 @@ class PiperRobotTrainer:
                 # 复位后同步位置
                 self._sync_actual_position()
 
+                # 帧初始化：匹配 piper_wrapper.reset() 约定
+                # 用 [black, black, first_real_frame] 而非 3 帧真实帧
                 self.frames_queue.clear()
-                for _ in range(self.frame_stack):
-                    frame = self.camera.capture()
-                    if frame is not None:
-                        self.frames_queue.append(frame)
+                first_frame = self.camera.capture()
+                if first_frame is None:
+                    first_frame = np.zeros((self.IMG_HEIGHT, self.IMG_WIDTH, 3), dtype=np.uint8)
+                black_frame = np.zeros_like(first_frame)
+                self.frames_queue.append(black_frame)
+                self.frames_queue.append(black_frame)
+                self.frames_queue.append(first_frame)
+
+                # Dummy 首步（匹配 manual_collect.py 和 train_mw.py 的 convention）
+                ts_dummy = TimeStep(
+                    observation=self.get_stacked_obs(),
+                    action=np.zeros(self._act_spec.shape, dtype=self._act_spec.dtype),
+                    reward=np.array([0.0], dtype=np.float32),
+                    discount=np.array([1.0], dtype=np.float32),
+                    first=True,
+                    is_last=False,
+                    is_intervened=np.array([0.0], dtype=np.float32),
+                )
+                self.replay_storage.add(ts_dummy)
 
                 obs_prev = self.get_stacked_obs()
 
