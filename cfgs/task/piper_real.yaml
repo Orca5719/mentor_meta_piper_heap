@@ -31,7 +31,7 @@ real:
   # Hand-eye calibration file (run calibration script first)
   calibration_file: null       # e.g., "calibration.npy"
 
-  # Manual reward: press SPACE for +10 reward + success, Q for e-stop
+  # Manual reward: 1=reached(+1), 2=grasped(+3), 3=lifted(+6), Q=e-stop
   manual_reward: true
 
 # Override training params for real robot
@@ -50,3 +50,8 @@ spacemouse:
   enabled: true
   dead_zone: 0.1          # input dead zone threshold
   intervention_bonus: 2.0  # loss weight multiplier for intervened steps
+
+# BC pretraining on demo data (recommended for real robot)
+bc_pretrain_steps: 10000   # number of BC gradient steps before RL
+bc_loss_type: mse          # 'mse' (simple, fast) or 'nll' (principled)
+bc_log_interval: 500
