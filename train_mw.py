@@ -202,6 +202,54 @@ class Workspace:
                 shutil.copy2(str(src), str(dst))
         print(f'[INFO] Loaded {len(npz_files)} pretrained buffer episodes from {pretrain_path}')
 
+    def pretrain_bc(self):
+        """Behavior Cloning pretraining on demo data.
+
+        Runs BC updates for cfg.bc_pretrain_steps using the preloaded
+        demo buffer. Only encoder + actor are updated; critic and
+        value_predictor remain at random init (they will be trained
+        during the subsequent RL phase).
+
+        Must be called after setup() and agent creation, and before train().
+        """
+        bc_steps = getattr(self.cfg, 'bc_pretrain_steps', 0)
+        bc_loss_type = getattr(self.cfg, 'bc_loss_type', 'mse')
+        bc_log_interval = getattr(self.cfg, 'bc_log_interval', 500)
+
+        if bc_steps <= 0:
+            return
+
+        # Check that buffer has demo data
+        buffer_size = len(self.replay_storage)
+        if buffer_size == 0:
+            print('[BC] WARNING: Replay buffer is empty, skipping BC pretraining')
+            return
+
+        print(f"\n{'='*60}")
+        print(f"  BC Pretraining: {bc_steps} steps, loss_type={bc_loss_type}")
+        print(f"  Demo buffer size: {buffer_size} transitions")
+        print(f"{'='*60}")
+
+        # Need to fetch buffer data into replay loader
+        self._replay_iter = iter(self.replay_loader)
+
+        for bc_step in range(1, bc_steps + 1):
+            metrics = self.agent.update_bc(self._replay_iter, bc_loss_type)
+
+            if bc_step % bc_log_interval == 0 or bc_step == 1:
+                print(f"[BC] step {bc_step}/{bc_steps} | "
+                      f"bc_loss={metrics.get('bc_loss', 0):.4f} | "
+                      f"action_error={metrics.get('bc_action_error', 0):.4f}")
+                if self.cfg.use_tb or self.cfg.use_wandb:
+                    with self.logger.log_and_dump_ctx(bc_step, ty='bc') as log:
+                        log('bc_loss', metrics.get('bc_loss', 0))
+                        log('bc_action_error', metrics.get('bc_action_error', 0))
+                        log('bc_step', bc_step)
+
+        # Save BC pretrained snapshot
+        self.save_snapshot(step_id='bc_pretrained')
+        print(f"[BC] Pretraining done. Snapshot saved as snapshot_bc_pretrained.pt\n")
+
     def update_buffer(self):
         #self.buffer.update_discount(self.discount)
         self.buffer.update_nstep(self.nstep)
@@ -386,7 +434,9 @@ def main(cfgs):
         snapshot = root_dir / 'snapshot.pt'
     if snapshot.exists():
         print(f'resuming: {snapshot}')
-        workspace.load_snapshot()        
+        workspace.load_snapshot()
+    # BC pretraining on demo data (before RL)
+    workspace.pretrain_bc()
     workspace.train()
 
 
