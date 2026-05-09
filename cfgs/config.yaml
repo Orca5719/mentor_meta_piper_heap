@@ -27,6 +27,10 @@ replay_buffer_num_workers: 4
 pretrain_buffer_dir: buffer_robot  # path to pretrained buffer dir (manually collected data)
 nstep: 3
 batch_size: 256
+# BC pretraining
+bc_pretrain_steps: 0     # 0 = no BC pretraining; set e.g. 10000 for real robot
+bc_loss_type: mse        # 'mse' or 'nll'
+bc_log_interval: 500
 # misc
 seed: 0
 device: cuda
