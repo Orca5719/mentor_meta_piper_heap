@@ -52,8 +52,8 @@ class SimpleSpacemouseCollect:
         self.spacemouse_reader = None
 
         # 图像参数
-        self.IMG_HEIGHT = 256
-        self.IMG_WIDTH = 256
+        self.IMG_HEIGHT = 84   # must match PiperEnv's image_size
+        self.IMG_WIDTH = 84    # must match PiperEnv's image_size
         self.frame_stack = 3
 
         # 机械臂初始位姿 (mm, deg 浮点单位，与 piper_env.py 一致)
@@ -79,14 +79,19 @@ class SimpleSpacemouseCollect:
 
         # Spacemouse 参数
         self.DEAD_ZONE = 0.15
-        self.SPACE_MOUSE_ACTION_SCALE = 20.0  # mm，最大位移/步
+        self.SPACE_MOUSE_ACTION_SCALE = 2.0   # mm per action unit, must match PiperEnv's action_scale
 
         # 控制参数
         self.control_sleep = 0.01
 
+        # Staged reward
+        self.STAGE_REWARDS = {1: 1.0, 2: 3.0, 3: 6.0}
+        self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
+        self.current_stage = 0
+
     def _init_specs(self):
         """直接硬编码spec，与 piper_env.py 的 piper_wrapper 输出一致。"""
-        # 3帧堆叠 × 3通道 = 9通道, 256×256, uint8
+        # 3帧堆叠 × 3通道 = 9通道, 84×84, uint8
         self._obs_spec = specs.BoundedArray(
             shape=(9, self.IMG_HEIGHT, self.IMG_WIDTH),
             dtype=np.uint8,
@@ -231,6 +236,65 @@ class SimpleSpacemouseCollect:
         self.set_gripper_open()
         time.sleep(2.0)
 
+    def _start_new_episode(self):
+        """开始新episode：清空帧队列，添加dummy首步。
+
+        匹配 train_mw.py 的 ReplayBuffer convention:
+        index 0 = reset observation + action=zeros（dummy），
+        index 1 = 第一个真实 action。
+        不加 dummy 的话，replay buffer 的 (obs[idx-1], action[idx]) 配对会错位。
+        """
+        # 清空帧队列，等待新鲜帧
+        with self._lock:
+            self.frames_queue.clear()
+            self._latest_frame = None
+
+        # 等待相机捕获新帧（最多0.5s）
+        for _ in range(50):
+            with self._lock:
+                if self._latest_frame is not None:
+                    break
+            time.sleep(0.01)
+
+        with self._lock:
+            if self._latest_frame is not None:
+                first_frame = self._latest_frame.copy()
+            else:
+                first_frame = np.zeros((self.IMG_HEIGHT, self.IMG_WIDTH, 3), dtype=np.uint8)
+
+        # 构建 initial stacked obs，匹配 piper_wrapper.reset() 约定：[black, black, first_frame]
+        black_frame = np.zeros_like(first_frame)
+        stacked = np.concatenate([black_frame, black_frame, first_frame], axis=-1)
+        stacked = np.transpose(stacked, (2, 0, 1))
+        if self._obs_spec.dtype == np.uint8:
+            obs_init = stacked.astype(np.uint8)
+        else:
+            obs_init = (stacked.astype(np.float32) / 255.0)
+
+        # 添加 dummy 首步（匹配 train_mw.py 中 reset 后立即 add 的 convention）
+        ts = TimeStep(
+            observation=obs_init,
+            action=np.zeros(self._act_spec.shape, dtype=self._act_spec.dtype),
+            reward=np.array([0.0], dtype=np.float32),
+            discount=np.array([1.0], dtype=np.float32),
+            first=True,
+            is_last=False,
+            is_intervened=np.array([1.0], dtype=np.float32),  # demo data
+        )
+        self.replay_storage.add(ts)
+
+        # 用 [black, first_frame] 初始化帧队列，使后续 stacked obs 自然过渡
+        with self._lock:
+            self.frames_queue.clear()
+            self.frames_queue.append(black_frame)
+            self.frames_queue.append(first_frame)
+
+        # 重置 episode 状态
+        self.episode_step = 0
+        self.end = False
+        self.current_stage = 0
+        self._last_action = np.zeros(self._act_spec.shape, dtype=self._act_spec.dtype)
+
     def collect(self, num_episodes=5, max_steps=200, episode_sleep=2.0):
         """主收集循环"""
         self.init_hardware()
@@ -241,8 +305,12 @@ class SimpleSpacemouseCollect:
         print("控制说明:")
         print("  3D鼠标移动: 控制机械臂X/Y/Z")
         print("  按钮0: 夹爪关闭 | 按钮1: 夹爪打开")
-        print("  空格: +10奖励并结束当前episode | Q: 退出并保存")
+        print("  1: 到达(+1) | 2: 抓住(+3) | 3: 提起(+6) 并结束episode")
+        print("  Q: 退出并保存")
         print("="*60)
+
+        # 添加第一个 episode 的 dummy 首步
+        self._start_new_episode()
 
         try:
             while self.episode < num_episodes and self._running:
@@ -291,16 +359,27 @@ class SimpleSpacemouseCollect:
                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     cv2.putText(display, f"Buffer: {len(self.replay_storage)}",
                                (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    cv2.putText(display, f"Stage: {self.STAGE_NAMES[self.current_stage]}",
+                               (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
                     if is_intervening:
-                        cv2.putText(display, "INTERVENING", (10, 110),
+                        cv2.putText(display, "INTERVENING", (10, 150),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                     cv2.imshow("Data Collection", display)
 
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord(' '):
-                    self.end = True
-                    current_reward = 10.0
-                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | +10.0")
+                if key == ord('1') and self.current_stage < 1:
+                    self.current_stage = 1
+                    current_reward = self.STAGE_REWARDS[1]
+                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | 到达 +{current_reward}")
+                elif key == ord('2') and self.current_stage < 2:
+                    self.current_stage = 2
+                    current_reward = self.STAGE_REWARDS[2]
+                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | 抓住 +{current_reward}")
+                elif key == ord('3') and self.current_stage < 3:
+                    self.current_stage = 3
+                    current_reward = self.STAGE_REWARDS[3]
+                    self.end = True  # 提起 = 成功, 结束episode
+                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | 提起 +{current_reward} ★")
                 elif key == ord('q'):
                     print("\n用户终止收集，正在保存数据...")
                     self._running = False
@@ -324,7 +403,7 @@ class SimpleSpacemouseCollect:
                         discount=np.array([1.0], dtype=np.float32),
                         first=(self.episode_step == 0),
                         is_last=False,
-                        is_intervened=np.array([1.0 if is_intervening else 0.0], dtype=np.float32),
+                        is_intervened=np.array([1.0], dtype=np.float32),  # all demo steps are expert data
                     )
                     self.replay_storage.add(ts)
 
@@ -332,7 +411,8 @@ class SimpleSpacemouseCollect:
                     self.data_buffer.append({
                         'observation': obs_t,
                         'action': action_t,
-                        'reward': current_reward
+                        'reward': current_reward,
+                        'is_intervened': 1.0  # demo data
                     })
 
                 self.episode_step += 1
@@ -346,7 +426,7 @@ class SimpleSpacemouseCollect:
                         discount=np.array([0.0], dtype=np.float32),
                         first=False,
                         is_last=True,
-                        is_intervened=np.array([0.0], dtype=np.float32),
+                        is_intervened=np.array([1.0], dtype=np.float32),  # demo terminal step
                     )
                     self.replay_storage.add(ts_last)
 
@@ -359,10 +439,9 @@ class SimpleSpacemouseCollect:
                     print(f"请重新摆放物体... 休眠 {episode_sleep}s")
                     time.sleep(episode_sleep)
 
-                    # 重置episode状态
+                    # 开始新episode（含dummy首步）
                     self.episode += 1
-                    self.episode_step = 0
-                    self.end = False
+                    self._start_new_episode()
 
                 time.sleep(self.control_sleep)
 
@@ -402,12 +481,14 @@ class SimpleSpacemouseCollect:
             observations = np.stack([d['observation'] for d in self.data_buffer])
             actions = np.stack([d['action'] for d in self.data_buffer])
             rewards = np.array([d['reward'] for d in self.data_buffer])
+            is_intervened = np.array([d['is_intervened'] for d in self.data_buffer])
 
             np.savez_compressed(
                 filename,
                 observations=observations,
                 actions=actions,
-                rewards=rewards
+                rewards=rewards,
+                is_intervened=is_intervened
             )
             print(f"✅ NPZ备份已保存: {os.path.abspath(filename)}")
         except Exception as e:
