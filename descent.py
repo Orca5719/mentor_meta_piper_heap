@@ -23,7 +23,6 @@ try:
     from piper_env import PiperRobot
     from realsense_camera import RealSenseCamera
     from spacemouse_reader import SpacemouseReader
-    import hydra
 except ImportError as e:
     print(f"错误：无法导入核心模块: {e}")
     sys.exit(1)
@@ -129,6 +128,10 @@ class PiperRobotTrainer:
         self.last_gripper_change_step = 0
         self.gripper_change_interval = 100
 
+        self.demo_ratio_start = 1.0
+        self.demo_ratio_end = 0.3
+        self.demo_ratio_decay_steps = 50000
+
         # 防卡死机制
         self.last_action_time = time.time()
         self.arm_command_lock = threading.Lock()
@@ -137,6 +140,14 @@ class PiperRobotTrainer:
 
         # 闭环位置反馈
         self.use_closed_loop = True
+
+        # 异步训练参数
+        self.async_update = True
+        self.async_update_interval = 0.01  # 异步更新间隔(秒)
+        self._async_update_count = 0
+        self._async_train_thread = None
+        self._async_pause = threading.Event()  # 同步更新时暂停异步线程
+        self._async_pause.clear()
 
     def _init_specs(self):
         """直接硬编码spec，与 piper_env.py 的 piper_wrapper 输出一致。"""
@@ -172,7 +183,10 @@ class PiperRobotTrainer:
 
         self.replay_loader, self._replay_buffer = make_replay_loader(
             self._buffer_dir, max_size=100000, batch_size=self.batch_size, num_workers=0,
-            save_snapshot=True, nstep=3, discount=0.99
+            save_snapshot=True, nstep=3, discount=0.99,
+            demo_ratio_start=self.demo_ratio_start,
+            demo_ratio_end=self.demo_ratio_end,
+            demo_ratio_decay_steps=self.demo_ratio_decay_steps,
         )
         self.replay_iter = iter(self.replay_loader)
 
@@ -224,6 +238,9 @@ class PiperRobotTrainer:
 
         # 机械臂状态监控线程
         threading.Thread(target=self._arm_status_monitor_thread, daemon=True).start()
+
+        # 异步训练线程
+        self._start_async_train()
 
         print("✅ 硬件初始化完成")
         print()
@@ -281,6 +298,35 @@ class PiperRobotTrainer:
             except Exception as e:
                 print(f"[图像线程错误] {e}")
             time.sleep(0.005)
+
+    def _train_thread(self):
+        """后台异步梯度更新线程"""
+        print("[异步训练] 线程已启动，等待seed阶段完成...")
+        while self._running:
+            if self.agent is None or self._global_step < self.seed_steps:
+                time.sleep(0.5)
+                continue
+            if self.replay_iter is None:
+                time.sleep(0.5)
+                continue
+            # 同步更新期间暂停
+            if self._async_pause.is_set():
+                time.sleep(0.01)
+                continue
+            try:
+                self.agent.update(self.replay_iter, self._global_step)
+                self._async_update_count += 1
+            except Exception as e:
+                pass  # 采样失败静默重试
+            time.sleep(self.async_update_interval)
+
+    def _start_async_train(self):
+        """启动异步训练线程"""
+        if not self.async_update:
+            return
+        self._async_train_thread = threading.Thread(target=self._train_thread, daemon=True)
+        self._async_train_thread.start()
+        print("✅ 异步训练线程已启动")
 
     def get_stacked_obs(self):
         with self._lock:
@@ -402,12 +448,12 @@ class PiperRobotTrainer:
             action[3] = self.random_gripper_state
             return action, False
 
-        # 智能体策略
+        # 智能体策略（no_grad纯读，不需要锁，允许与异步训练并行）
         with torch.no_grad(), utils.eval_mode(self.agent):
             action = self.agent.act(obs, self._global_step, eval_mode=False)
         return action, False
 
-    def update_policy(self, num_updates=100):
+    def update_policy(self, num_updates=20):
         if self.agent is None:
             print("⚠️  Agent未初始化，跳过策略更新")
             return
@@ -426,14 +472,19 @@ class PiperRobotTrainer:
             return
 
         try:
-            print(f"\n开始更新策略，执行 {num_updates} 次梯度更新...")
+            async_info = f" (异步已更新{self._async_update_count}步)" if self.async_update else ""
+            print(f"\n开始同步更新策略，执行 {num_updates} 次梯度更新{async_info}...")
+            self._async_pause.set()  # 暂停异步线程
+            time.sleep(0.02)  # 等待异步线程退出当前update
             for i in range(num_updates):
                 metrics = self.agent.update(self.replay_iter, self._global_step)
-                if i % 20 == 0:
+                if i % 10 == 0:
                     print(f"  进度: {i+1}/{num_updates}", end='\r')
-            print(f"\n✅ 策略更新完成")
+            self._async_pause.clear()  # 恢复异步线程
+            print(f"\n✅ 同步策略更新完成")
             return metrics
         except Exception as e:
+            self._async_pause.clear()  # 出错也要恢复
             print(f"❌ 策略更新失败: {e}")
             return None
 
@@ -741,6 +792,9 @@ class PiperRobotTrainer:
     def cleanup(self):
         print("\n清理资源...")
         self._running = False
+        # 异步训练线程是daemon，进程退出自动终止，不需要join
+        if self._async_update_count > 0:
+            print(f"  异步训练统计: 共 {self._async_update_count} 步异步更新")
         time.sleep(0.5)
         cv2.destroyAllWindows()
 
@@ -773,52 +827,35 @@ def main():
     parser.add_argument('--steps', type=int, default=1500, help='每个 episode 最大步数')
     parser.add_argument('--bc_steps', type=int, default=10000, help='BC预训练步数 (0=不预训练)')
     parser.add_argument('--bc_loss', type=str, default='mse', choices=['mse', 'nll'], help='BC损失类型')
+    parser.add_argument('--demo_ratio_start', type=float, default=1.0, help='Demo采样初始比例')
+    parser.add_argument('--demo_ratio_end', type=float, default=0.3, help='Demo采样最终比例')
+    parser.add_argument('--demo_ratio_decay', type=int, default=50000, help='Demo比例衰减步数')
+    parser.add_argument('--no_async', action='store_true', help='禁用异步训练(回退纯同步模式)')
+    parser.add_argument('--async_interval', type=float, default=0.01, help='异步更新间隔(秒)')
 
     args = parser.parse_args()
 
-    try:
-        with hydra.initialize(config_path='cfgs', version_base=None):
-            cfg = hydra.compose(config_name='config', overrides=['agent=mentor_mw'])
-    except Exception as e:
-        print(f"⚠️  无法加载Hydra配置: {e}")
-        cfg = None
-
     trainer = PiperRobotTrainer()
+    trainer.demo_ratio_start = args.demo_ratio_start
+    trainer.demo_ratio_end = args.demo_ratio_end
+    trainer.demo_ratio_decay_steps = args.demo_ratio_decay
+    trainer.async_update = not args.no_async
+    trainer.async_update_interval = args.async_interval
     trainer.init_hardware()
 
-    agent_initialized = False
-
-    if cfg is not None:
-        try:
-            obs_spec = trainer._obs_spec
-            act_spec = trainer._act_spec
-            cfg.agent.obs_shape = obs_spec.shape
-            cfg.agent.action_shape = act_spec.shape
-            trainer.agent = hydra.utils.instantiate(cfg.agent)
-            trainer.agent = trainer.agent.to(trainer.device)
-            agent_initialized = True
-            print("✅ Agent初始化成功（Hydra）")
-        except Exception as e:
-            import traceback
-            print(f"❌ Agent初始化失败（Hydra）:")
-            traceback.print_exc()
-
-    if not agent_initialized:
-        print("Hydra不可用，使用独立Agent配置...")
-        try:
-            from agent_piper import create_piper_agent
-            trainer.agent = create_piper_agent(
-                obs_shape=trainer._obs_spec.shape,
-                action_shape=trainer._act_spec.shape,
-                device=trainer.device,
-            )
-            agent_initialized = True
-            print("✅ Agent初始化成功（独立配置）")
-        except Exception as e:
-            import traceback
-            print(f"❌ Agent初始化失败:")
-            traceback.print_exc()
-            trainer.agent = None
+    try:
+        from agent_piper import create_piper_agent
+        trainer.agent = create_piper_agent(
+            obs_shape=trainer._obs_spec.shape,
+            action_shape=trainer._act_spec.shape,
+            device=trainer.device,
+        )
+        print("✅ Agent初始化成功")
+    except Exception as e:
+        import traceback
+        print(f"❌ Agent初始化失败:")
+        traceback.print_exc()
+        trainer.agent = None
 
     if args.snapshot:
         trainer.load_snapshot(args.snapshot)
