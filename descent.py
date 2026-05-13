@@ -146,8 +146,10 @@ class PiperRobotTrainer:
         self.async_update_interval = 0.01  # 异步更新间隔(秒)
         self._async_update_count = 0
         self._async_train_thread = None
-        self._async_pause = threading.Event()  # 同步更新时暂停异步线程
+        self._async_pause = threading.Event()  # 请求异步线程暂停
+        self._async_paused = threading.Event()  # 异步线程确认已暂停
         self._async_pause.clear()
+        self._async_paused.clear()
 
     def _init_specs(self):
         """直接硬编码spec，与 piper_env.py 的 piper_wrapper 输出一致。"""
@@ -309,10 +311,12 @@ class PiperRobotTrainer:
             if self.replay_iter is None:
                 time.sleep(0.5)
                 continue
-            # 同步更新期间暂停
+            # 被请求暂停时，确认暂停并等待恢复
             if self._async_pause.is_set():
+                self._async_paused.set()  # 通知主线程：我已停下
                 time.sleep(0.01)
                 continue
+            self._async_paused.clear()
             try:
                 self.agent.update(self.replay_iter, self._global_step)
                 self._async_update_count += 1
@@ -474,17 +478,22 @@ class PiperRobotTrainer:
         try:
             async_info = f" (异步已更新{self._async_update_count}步)" if self.async_update else ""
             print(f"\n开始同步更新策略，执行 {num_updates} 次梯度更新{async_info}...")
-            self._async_pause.set()  # 暂停异步线程
-            time.sleep(0.02)  # 等待异步线程退出当前update
+            if self.async_update:
+                self._async_pause.set()
+                self._async_paused.wait(timeout=5.0)  # 等异步线程确认停下
             for i in range(num_updates):
                 metrics = self.agent.update(self.replay_iter, self._global_step)
                 if i % 10 == 0:
                     print(f"  进度: {i+1}/{num_updates}", end='\r')
-            self._async_pause.clear()  # 恢复异步线程
+            if self.async_update:
+                self._async_pause.clear()
+                self._async_paused.clear()
             print(f"\n✅ 同步策略更新完成")
             return metrics
         except Exception as e:
-            self._async_pause.clear()  # 出错也要恢复
+            if self.async_update:
+                self._async_pause.clear()
+                self._async_paused.clear()
             print(f"❌ 策略更新失败: {e}")
             return None
 
@@ -712,6 +721,13 @@ class PiperRobotTrainer:
                         self.frames_queue.append(new_frame)
                     obs_curr = self.get_stacked_obs()
 
+                    # 可视化（按键奖励在这里产生，必须在奖励读取之前）
+                    if not self.visualize(obs_curr, 0.0, step):
+                        step_bar.close()
+                        episodes_bar.close()
+                        print("\n用户退出训练")
+                        return
+
                     # 奖励
                     reward = self._reward
                     if self._reward != 0:
@@ -745,13 +761,6 @@ class PiperRobotTrainer:
                         'Reward': f"{self.episode_reward:.1f}",
                         'Intervene': self.is_intervening
                     })
-
-                    # 可视化
-                    if not self.visualize(obs_curr, reward, step):
-                        step_bar.close()
-                        episodes_bar.close()
-                        print("\n用户退出训练")
-                        return
 
                     # 按3(提起)后提前结束episode
                     if self.current_stage >= 3:
