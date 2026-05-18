@@ -131,6 +131,7 @@ class PiperRobotTrainer:
         self.demo_ratio_start = 1.0
         self.demo_ratio_end = 0.3
         self.demo_ratio_decay_steps = 50000
+        self.negative_ratio = 0.2
 
         # 防卡死机制
         self.last_action_time = time.time()
@@ -189,6 +190,7 @@ class PiperRobotTrainer:
             demo_ratio_start=self.demo_ratio_start,
             demo_ratio_end=self.demo_ratio_end,
             demo_ratio_decay_steps=self.demo_ratio_decay_steps,
+            negative_ratio=self.negative_ratio,
         )
         self.replay_iter = iter(self.replay_loader)
 
@@ -841,6 +843,7 @@ def main():
     parser.add_argument('--demo_ratio_decay', type=int, default=50000, help='Demo比例衰减步数')
     parser.add_argument('--no_async', action='store_true', help='禁用异步训练(回退纯同步模式)')
     parser.add_argument('--async_interval', type=float, default=0.01, help='异步更新间隔(秒)')
+    parser.add_argument('--negative_ratio', type=float, default=0.2, help='RL阶段负样本采样比例(0=不采样负样本)')
 
     args = parser.parse_args()
 
@@ -848,6 +851,7 @@ def main():
     trainer.demo_ratio_start = args.demo_ratio_start
     trainer.demo_ratio_end = args.demo_ratio_end
     trainer.demo_ratio_decay_steps = args.demo_ratio_decay
+    trainer.negative_ratio = args.negative_ratio
     trainer.async_update = not args.no_async
     trainer.async_update_interval = args.async_interval
     trainer.init_hardware()
