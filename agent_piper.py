@@ -55,7 +55,7 @@ def create_piper_agent(obs_shape, action_shape, device):
         # IQL expectile
         expectile=0.9,
         # 日志
-        use_tb=False,
+        use_tb= True,
         # 辅助损失
         aux_loss_scale_warmup=-1,
         aux_loss_scale_warmsteps=-1,

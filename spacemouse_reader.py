@@ -110,10 +110,19 @@ class SpacemouseReader:
             return self._is_intervening
 
     def _read_loop(self):
-        """Background thread: continuously read Spacemouse state."""
+        """Background thread: continuously read Spacemouse state.
+
+        Handles device disconnection by attempting to reconnect.
+        """
         while self._running:
             try:
                 state = self._device.read()
+
+                if state is None:
+                    # Device returned None, try to reconnect
+                    self._try_reconnect()
+                    time.sleep(0.1)
+                    continue
 
                 # Extract 6-DOF axes
                 axes = np.array([
@@ -157,8 +166,41 @@ class SpacemouseReader:
                     self._latest_action = action
                     self._is_intervening = is_intervening
 
+                # Clear intervention state if no input
+                if not is_intervening:
+                    with self._lock:
+                        self._is_intervening = False
+
+            except (OSError, IOError) as e:
+                # USB disconnect typically raises these
+                print(f"[SpacemouseReader] Device error (disconnect?): {e}")
+                self._try_reconnect()
+                time.sleep(0.5)
             except Exception as e:
                 print(f"[SpacemouseReader] Read error: {e}")
+                time.sleep(0.05)
 
             # ~100Hz polling rate
             time.sleep(0.01)
+
+    def _try_reconnect(self):
+        """Attempt to reopen the Spacemouse device."""
+        print("[SpacemouseReader] Attempting to reconnect...")
+        try:
+            if self._device is not None:
+                try:
+                    self._device.close()
+                except Exception:
+                    pass
+            self._device = pyspacemouse.open(device_index=self._device_index)
+            if self._device is not None:
+                print("[SpacemouseReader] Reconnected successfully.")
+            else:
+                print("[SpacemouseReader] Reconnect returned None.")
+        except Exception as e:
+            print(f"[SpacemouseReader] Reconnect failed: {e}")
+
+    @property
+    def is_alive(self):
+        """Check if the reader thread is still running."""
+        return self._thread is not None and self._thread.is_alive()
