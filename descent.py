@@ -99,8 +99,8 @@ class PiperRobotTrainer:
         self.WS_Y_MIN, self.WS_Y_MAX = -150.0, 150.0
         self.WS_Z_MIN, self.WS_Z_MAX = 150.0, 350.0
 
-        # 时间惩罚：非干预帧每秒-1 reward，鼓励agent高效行动
-        self.time_penalty_per_step = -1.0 * self.action_interval  # ≈ -0.08/步
+        # 时间惩罚：非干预帧每秒-0.33 reward，鼓励agent高效行动
+        self.time_penalty_per_step = -0.33 * self.action_interval  # ≈ -0.026/步
 
         self.random_amplitude = 0.6
         self.random_drift_prob = 0.2
