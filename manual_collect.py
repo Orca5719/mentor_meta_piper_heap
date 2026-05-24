@@ -85,7 +85,7 @@ class SimpleSpacemouseCollect:
         self.control_sleep = 0.01
 
         # Staged reward
-        self.STAGE_REWARDS = {1: 1.0, 2: 3.0, 3: 6.0}
+        self.STAGE_REWARDS = {1: 6.0, 2: 3.0, 3: 1.0}
         self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
         self.current_stage = 0
 
@@ -305,7 +305,7 @@ class SimpleSpacemouseCollect:
         print("控制说明:")
         print("  3D鼠标移动: 控制机械臂X/Y/Z")
         print("  按钮0: 夹爪关闭 | 按钮1: 夹爪打开")
-        print("  1: 到达(+1) | 2: 抓住(+3) | 3: 提起(+6) 并结束episode")
+        print("  1: 到达(+6) | 2: 抓住(+3) | 3: 提起(+1) 并结束episode")
         print("  Q: 退出并保存")
         print("="*60)
 

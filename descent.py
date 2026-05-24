@@ -99,7 +99,7 @@ class PiperRobotTrainer:
         self.WS_Y_MIN, self.WS_Y_MAX = -150.0, 150.0
         self.WS_Z_MIN, self.WS_Z_MAX = 150.0, 350.0
 
-        # 时间惩罚：非干预帧每秒-0.33 reward，鼓励agent高效行动
+        # 时间惩罚：非干预帧每秒-0.33 reward，与631总额10匹配
         self.time_penalty_per_step = -0.33 * self.action_interval  # ≈ -0.026/步
 
         self.random_amplitude = 0.6
@@ -119,7 +119,7 @@ class PiperRobotTrainer:
         self.is_intervening = False
 
         # Staged reward
-        self.STAGE_REWARDS = {1: 1.0, 2: 3.0, 3: 6.0}
+        self.STAGE_REWARDS = {1: 6.0, 2: 3.0, 3: 1.0}
         self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
         self.current_stage = 0
 
