@@ -42,18 +42,18 @@ except ImportError:
 class KeyboardRewardListener:
     """Background thread that listens for staged manual reward.
 
-    Staged reward scheme:
-      Key 1 → "到达" (reached):  reward +1.0,  stage=1
+    Staged reward scheme (631):
+      Key 1 → "到达" (reached):  reward +6.0,  stage=1
       Key 2 → "抓住" (grasped):  reward +3.0,  stage=2
-      Key 3 → "提起" (lifted):   reward +6.0,  stage=3, success=True
+      Key 3 → "提起" (lifted):   reward +1.0,  stage=3, success=True
       Key Q → emergency stop
 
-    Total max reward per episode = 1.0 + 3.0 + 6.0 = 10.0.
+    Total max reward per episode = 6.0 + 3.0 + 1.0 = 10.0.
     Stages are progressive: pressing a later key implicitly advances the stage.
     """
 
     # Staged reward constants
-    STAGE_REWARDS = {1: 1.0, 2: 3.0, 3: 6.0}
+    STAGE_REWARDS = {1: 6.0, 2: 3.0, 3: 1.0}
     STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
 
     def __init__(self):
@@ -71,7 +71,7 @@ class KeyboardRewardListener:
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
         print("[KeyboardReward] Listener started. "
-              "1=reached(+1), 2=grasped(+3), 3=lifted(+6), Q=e-stop")
+              "1=reached(+6), 2=grasped(+3), 3=lifted(+1), Q=e-stop")
 
     def stop(self):
         """Stop the keyboard listener."""
@@ -446,7 +446,7 @@ class PiperEnv:
                     [dx, dy, dz, gripper] all in [-1, 1]
 
         Reward and success are provided by the human operator:
-          Key 1 = reached (+1.0), Key 2 = grasped (+3.0), Key 3 = lifted (+6.0).
+          Key 1 = reached (+6.0), Key 2 = grasped (+3.0), Key 3 = lifted (+1.0).
         """
         action = action["action"]
         assert action.shape == (4,), f"Expected action shape (4,), got {action.shape}"
