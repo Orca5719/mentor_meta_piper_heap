@@ -4,7 +4,10 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 import os
 import sys
 import time
+import gc
 import cv2
+import json
+import shutil
 import numpy as np
 import torch
 import threading
@@ -27,6 +30,11 @@ except ImportError as e:
     print(f"错误：无法导入核心模块: {e}")
     sys.exit(1)
 
+try:
+    from ollama import chat as ollama_chat
+except ImportError:
+    ollama_chat = None
+
 _TimeStepBase = namedtuple('_TimeStepBase', [
     'observation', 'action', 'reward', 'discount', 'first', 'is_last', 'is_intervened'
 ])
@@ -39,6 +47,193 @@ class TimeStep(_TimeStepBase):
 
     def last(self):
         return self.is_last
+
+
+class OllamaGoalRewarder:
+    """基于 Ollama VLM 的分段自动目标检测奖励器。
+
+    支持三阶段判定（reached/grasped/lifted），每个阶段对应一张目标图片。
+    VLM 只判断当前尚未达到的下一阶段，匹配则推进阶段并触发对应分段奖励。
+
+    目标图片默认存放在 images/ 目录下：
+        images/target_reached.jpg  — 阶段1: 机械臂到达物体附近
+        images/target_grasped.jpg  — 阶段2: 机械臂抓住物体
+        images/target_lifted.jpg   — 阶段3: 机械臂提起物体
+    """
+
+    STAGE_NAMES = {1: 'reached', 2: 'grasped', 3: 'lifted'}
+    STAGE_PROMPTS = {
+        1: '你将看到两张图片。第1张是"机械臂已到达物体附近"的目标状态图，第2张是当前实时图。'
+           '请判断当前图中机械臂是否已经到达物体附近（无需抓住，只需靠近）。'
+           '忽略轻微视角、光照、背景噪声差异。'
+           '如果机械臂已到达物体附近，is_match=true，否则为 false。'
+           '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
+        2: '你将看到两张图片。第1张是"机械臂已抓住物体"的目标状态图，第2张是当前实时图。'
+           '请判断当前图中机械臂是否已经抓住物体（夹爪闭合，物体被夹住）。'
+           '忽略轻微视角、光照、背景噪声差异。'
+           '如果机械臂已抓住物体，is_match=true，否则为 false。'
+           '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
+        3: '你将看到两张图片。第1张是"机械臂已提起物体"的目标状态图，第2张是当前实时图。'
+           '请判断当前图中机械臂是否已经成功提起物体（物体离开桌面或原位）。'
+           '忽略轻微视角、光照、背景噪声差异。'
+           '如果机械臂已提起物体，is_match=true，否则为 false。'
+           '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
+    }
+
+    def __init__(self, model, images_dir, output_dir,
+                 confidence_threshold=0.80, check_every_steps=5):
+        self.model = model
+        self.images_dir = Path(images_dir)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.confidence_threshold = float(confidence_threshold)
+        self.check_every_steps = max(1, int(check_every_steps))
+        self.current_frame_path = self.output_dir / 'vlm_current_frame.jpg'
+        self.target_paths = self._prepare_target_images()
+        self.last_result = self._default_result(stage=0, reason='尚未开始检测')
+
+    def _default_result(self, stage=0, reason='未检测'):
+        return {
+            'stage': stage,
+            'is_match': False,
+            'confidence': 0.0,
+            'reason': reason,
+            'raw': ''
+        }
+
+    def _find_image(self, stage):
+        """在 images_dir 下查找指定阶段的目标图片（支持 jpg/png/jpeg/bmp/webp）。"""
+        name = f'target_{self.STAGE_NAMES[stage]}'
+        for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+            candidate = self.images_dir / f'{name}{ext}'
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _prepare_target_images(self):
+        """加载并复制三阶段目标图片到输出目录。"""
+        paths = {}
+        missing = []
+        for stage in [1, 2, 3]:
+            src = self._find_image(stage)
+            if src is None:
+                missing.append(f'target_{self.STAGE_NAMES[stage]}.jpg')
+                continue
+            dst = self.output_dir / f'target_{self.STAGE_NAMES[stage]}{src.suffix}'
+            if src.resolve() != dst.resolve():
+                shutil.copy2(str(src), str(dst))
+            paths[stage] = str(dst)
+
+        if missing:
+            raise FileNotFoundError(
+                f'缺少目标图片，请将以下图片放入 {self.images_dir.resolve()}/ 目录: '
+                f'{", ".join(missing)}'
+            )
+        return paths
+
+    def _extract_json(self, content):
+        content = (content or '').strip()
+        if not content:
+            return {}
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find('{')
+            end = content.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                return json.loads(content[start:end + 1])
+            raise
+
+    def _coerce_bool(self, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ('true', '1', 'yes', 'y')
+        if isinstance(value, (int, float)):
+            return value != 0
+        return False
+
+    def _coerce_confidence(self, value):
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence > 1.0:
+            confidence = confidence / 100.0
+        return max(0.0, min(1.0, confidence))
+
+    def evaluate(self, frame_rgb, current_stage, episode, step):
+        """评估当前帧是否达到下一个阶段。
+
+        Args:
+            frame_rgb: 当前RGB帧
+            current_stage: 当前已达到的阶段 (0=none, 1=reached, 2=grasped)
+            episode: 当前episode编号
+            step: 当前全局步数
+
+        Returns:
+            dict: {'stage', 'is_match', 'confidence', 'reason', 'raw'}
+                  stage=匹配的阶段编号(1/2/3)，未匹配时等于current_stage
+        """
+        if current_stage >= 3:
+            return self.last_result
+
+        if step % self.check_every_steps != 0:
+            return self.last_result
+
+        if ollama_chat is None:
+            result = self._default_result(stage=current_stage, reason='未安装 ollama Python 包')
+            self.last_result = result
+            return result
+
+        # 判断下一个未达到的阶段
+        next_stage = current_stage + 1
+
+        try:
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(self.current_frame_path), frame_bgr)
+
+            prompt = self.STAGE_PROMPTS[next_stage]
+
+            response = ollama_chat(
+                model=self.model,
+                messages=[{
+                    'role': 'user',
+                    'content': prompt,
+                    'images': [self.target_paths[next_stage], str(self.current_frame_path)]
+                }],
+                format='json',
+                stream=False,
+                options={'temperature': 0}
+            )
+
+            if hasattr(response, 'message'):
+                raw_content = response.message.content
+            else:
+                raw_content = response['message']['content']
+
+            parsed = self._extract_json(raw_content)
+            is_match = self._coerce_bool(
+                parsed.get('is_match', parsed.get('matched', False))
+            )
+            confidence = self._coerce_confidence(parsed.get('confidence', 0.0))
+            reason = str(parsed.get('reason', ''))
+
+            matched_stage = next_stage if (is_match and confidence >= self.confidence_threshold) else current_stage
+
+            result = {
+                'stage': matched_stage,
+                'is_match': is_match,
+                'confidence': confidence,
+                'reason': reason[:120],
+                'raw': raw_content
+            }
+            self.last_result = result
+            return result
+        except Exception as exc:
+            result = self._default_result(stage=current_stage, reason=f'VLM 检测失败: {exc}')
+            self.last_result = result
+            return result
 
 
 class PiperRobotTrainer:
@@ -152,6 +347,15 @@ class PiperRobotTrainer:
         self._async_pause.clear()
         self._async_paused.clear()
 
+        # VLM 自动奖励
+        self.use_vlm_reward = False
+        self.ollama_model = 'gemma4'
+        self.images_dir = str(Path(script_dir) / 'images')
+        self.vlm_confidence_threshold = 0.80
+        self.vlm_check_every = 5
+        self.vlm_rewarder = None
+        self.last_vlm_result = None
+
     def _init_specs(self):
         """直接硬编码spec，与 piper_env.py 的 piper_wrapper 输出一致。"""
         self._obs_spec = specs.BoundedArray(
@@ -227,6 +431,26 @@ class PiperRobotTrainer:
         self._sync_actual_position()
 
         self._init_replay_storage()
+
+        # VLM 自动奖励初始化
+        if self.use_vlm_reward:
+            try:
+                self.vlm_rewarder = OllamaGoalRewarder(
+                    model=self.ollama_model,
+                    images_dir=self.images_dir,
+                    output_dir=self.output_dir,
+                    confidence_threshold=self.vlm_confidence_threshold,
+                    check_every_steps=self.vlm_check_every,
+                )
+                self.last_vlm_result = self.vlm_rewarder.last_result
+                print(f"✅ VLM 自动奖励已启用 | model={self.ollama_model}")
+                print(f"✅ 目标图片目录: {self.vlm_rewarder.images_dir.resolve()}")
+                for stage, path in self.vlm_rewarder.target_paths.items():
+                    print(f"   阶段{stage}({OllamaGoalRewarder.STAGE_NAMES[stage]}): {Path(path).name}")
+            except Exception as e:
+                print(f"⚠️  VLM 自动奖励初始化失败: {e}")
+                self.use_vlm_reward = False
+                self.vlm_rewarder = None
 
         # 3D鼠标：使用 SpacemouseReader（非阻塞）
         self.spacemouse_reader = SpacemouseReader(
@@ -584,11 +808,46 @@ class PiperRobotTrainer:
                    cv2.FONT_HERSHEY_SIMPLEX, font_body, (255, 255, 255), thick)
         y_pos += line_spacing
 
+        # VLM 状态显示
+        if self.vlm_rewarder is not None and self.last_vlm_result is not None:
+            vlm_stage = self.last_vlm_result.get('stage', 0)
+            match_text = f"Stage {vlm_stage}" if self.last_vlm_result.get('is_match') else "Checking"
+            confidence = self.last_vlm_result.get('confidence', 0.0)
+            match_color = (0, 255, 0) if self.last_vlm_result.get('is_match') else (0, 165, 255)
+            cv2.putText(frame_bgr, f"VLM: {match_text} ({confidence:.2f})", (10, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_body, match_color, thick)
+            y_pos += line_spacing
+            reason = str(self.last_vlm_result.get('reason', ''))
+            reason = reason[:35] + '...' if len(reason) > 38 else reason
+            cv2.putText(frame_bgr, f"Why: {reason}", (10, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_small, (180, 220, 255), thin)
+            y_pos += line_spacing
+
         cv2.putText(frame_bgr, "1=reached 2=grasped 3=lifted s=Save q=Quit", (10, y_pos),
                    cv2.FONT_HERSHEY_SIMPLEX, font_small, (0, 200, 255), thin)
 
         cv2.imshow("Piper Robot Training", frame_bgr)
 
+        # VLM 自动检测（在按键处理之前）
+        if self.vlm_rewarder is not None:
+            self.last_vlm_result = self.vlm_rewarder.evaluate(
+                frame, self.current_stage, self._global_episode, self._global_step
+            )
+            vlm_matched_stage = self.last_vlm_result.get('stage', self.current_stage)
+            if vlm_matched_stage > self.current_stage:
+                # VLM判定达到下一阶段，推进分段奖励
+                for s in range(self.current_stage + 1, vlm_matched_stage + 1):
+                    self.current_stage = s
+                    self._reward += self.STAGE_REWARDS[s]
+                stage_name = OllamaGoalRewarder.STAGE_NAMES.get(vlm_matched_stage, '?')
+                print(
+                    f"[VLM自动奖励] Ep{self._global_episode+1} Step{self._global_step} | "
+                    f"stage {vlm_matched_stage}({stage_name}) +{self.STAGE_REWARDS[vlm_matched_stage]:.0f} | "
+                    f"conf={self.last_vlm_result['confidence']:.2f} | "
+                    f"{self.last_vlm_result['reason']}"
+                )
+
+        # 键盘分段奖励
         key = cv2.waitKey(1) & 0xFF
         if key == ord('1') and self.current_stage < 1:
             self.current_stage = 1
@@ -844,6 +1103,13 @@ def main():
     parser.add_argument('--no_async', action='store_true', help='禁用异步训练(回退纯同步模式)')
     parser.add_argument('--async_interval', type=float, default=0.01, help='异步更新间隔(秒)')
     parser.add_argument('--negative_ratio', type=float, default=0.2, help='RL阶段负样本采样比例(0=不采样负样本)')
+    # VLM 自动奖励
+    parser.add_argument('--use_vlm_reward', action='store_true', help='启用基于 Ollama VLM 的自动奖励')
+    parser.add_argument('--ollama_model', type=str, default='gemma4', help='Ollama 模型名，默认 gemma4')
+    parser.add_argument('--images_dir', type=str, default=str(Path(script_dir) / 'images'),
+                        help='三阶段目标图片目录，默认 images/，需包含 target_reached.jpg, target_grasped.jpg, target_lifted.jpg')
+    parser.add_argument('--vlm_confidence_threshold', type=float, default=0.80, help='VLM 判定成功所需的最小置信度')
+    parser.add_argument('--vlm_check_every', type=int, default=5, help='每隔多少步调用一次 VLM 判定，默认每5步')
 
     args = parser.parse_args()
 
@@ -854,6 +1120,12 @@ def main():
     trainer.negative_ratio = args.negative_ratio
     trainer.async_update = not args.no_async
     trainer.async_update_interval = args.async_interval
+    # VLM 自动奖励参数
+    trainer.use_vlm_reward = args.use_vlm_reward
+    trainer.ollama_model = args.ollama_model
+    trainer.images_dir = args.images_dir
+    trainer.vlm_confidence_threshold = args.vlm_confidence_threshold
+    trainer.vlm_check_every = args.vlm_check_every
     trainer.init_hardware()
 
     try:

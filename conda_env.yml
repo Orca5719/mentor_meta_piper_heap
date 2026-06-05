@@ -27,3 +27,4 @@ dependencies:
       - tb-nightly
       - gym==0.23.0
       - mujoco-py==2.1.2.14
+      - ollama
