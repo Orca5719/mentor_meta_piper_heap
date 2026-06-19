@@ -11,6 +11,7 @@ import shutil
 import numpy as np
 import torch
 import threading
+import concurrent.futures
 from collections import deque, namedtuple
 from pathlib import Path
 from dm_env import StepType, specs
@@ -30,10 +31,11 @@ except ImportError as e:
     print(f"错误：无法导入核心模块: {e}")
     sys.exit(1)
 
+import base64
 try:
-    from ollama import chat as ollama_chat
+    from openai import OpenAI
 except ImportError:
-    ollama_chat = None
+    OpenAI = None
 
 _TimeStepBase = namedtuple('_TimeStepBase', [
     'observation', 'action', 'reward', 'discount', 'first', 'is_last', 'is_intervened'
@@ -49,8 +51,8 @@ class TimeStep(_TimeStepBase):
         return self.is_last
 
 
-class OllamaGoalRewarder:
-    """基于 Ollama VLM 的分段自动目标检测奖励器。
+class DoubaoGoalRewarder:
+    """基于豆包 VLM 的分段自动目标检测奖励器。
 
     支持三阶段判定（reached/grasped/lifted），每个阶段对应一张目标图片。
     VLM 只判断当前尚未达到的下一阶段，匹配则推进阶段并触发对应分段奖励。
@@ -61,28 +63,48 @@ class OllamaGoalRewarder:
         images/target_lifted.jpg   — 阶段3: 机械臂提起物体
     """
 
+    # ========== 在这里填写豆包 API Key ==========
+    DOUBAO_API_KEY = 'ark-83458e07-1bbb-4535-be7f-bb811b611b20-a056d'
+    # ============================================
+
+    DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
+    DOUBAO_MODEL = 'ep-20260606175321-9sh48'
+
     STAGE_NAMES = {1: 'reached', 2: 'grasped', 3: 'lifted'}
     STAGE_PROMPTS = {
-        1: '你将看到两张图片。第1张是"机械臂已到达物体附近"的目标状态图，第2张是当前实时图。'
-           '请判断当前图中机械臂是否已经到达物体附近（无需抓住，只需靠近）。'
-           '忽略轻微视角、光照、背景噪声差异。'
-           '如果机械臂已到达物体附近，is_match=true，否则为 false。'
+        1: '你正在观察一个机械臂操作的实时画面。'
+           '请判断当前画面中，机械臂夹爪是否已经接近桌面上的物体（红色方块）。'
+           '判断标准：夹爪末端与物体之间的距离是否已经很近（夹爪在物体正上方或旁边），不需要抓住。'
+           '注意：物体在桌面上的位置不固定，只需关注夹爪与物体的相对距离。'
+           '如果夹爪已接近物体，is_match=true，否则为 false。'
            '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
-        2: '你将看到两张图片。第1张是"机械臂已抓住物体"的目标状态图，第2张是当前实时图。'
-           '请判断当前图中机械臂是否已经抓住物体（夹爪闭合，物体被夹住）。'
-           '忽略轻微视角、光照、背景噪声差异。'
-           '如果机械臂已抓住物体，is_match=true，否则为 false。'
+        2: '你正在观察一个机械臂操作的实时画面。'
+           '请判断当前画面中，机械臂夹爪是否已经夹住物体（红色方块）。'
+           '关键判断标准：夹爪的两个指是否已经闭合，且物体（红色方块）被夹在两个指之间。'
+           '与"仅接近"的区别："接近"时夹爪是张开的（两指之间有明显间距），"夹住"时夹爪两指已合拢，物体被卡在中间。'
+           '请仔细观察夹爪两指之间的间距：如果间距大、物体在夹爪外面，说明只是接近未夹住；如果间距小、物体在两指之间，说明已夹住。'
+           '如果夹爪已闭合且物体在两指之间，is_match=true，否则为 false。'
            '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
-        3: '你将看到两张图片。第1张是"机械臂已提起物体"的目标状态图，第2张是当前实时图。'
-           '请判断当前图中机械臂是否已经成功提起物体（物体离开桌面或原位）。'
-           '忽略轻微视角、光照、背景噪声差异。'
-           '如果机械臂已提起物体，is_match=true，否则为 false。'
+        3: '你正在观察一个机械臂操作的实时画面。'
+           '请判断当前画面中，机械臂是否已经成功提起物体（红色方块）离开桌面。'
+           '判断标准：物体是否已经离开桌面，被夹爪悬空持住。'
+           '注意：物体被提起后的位置不固定，只需关注物体是否离开桌面。'
+           '如果物体已离开桌面并被夹持悬空，is_match=true，否则为 false。'
            '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
     }
 
-    def __init__(self, model, images_dir, output_dir,
-                 confidence_threshold=0.80, check_every_steps=5):
-        self.model = model
+    def __init__(self, model=None, images_dir='images', output_dir='.',
+                 confidence_threshold=0.60, check_every_steps=5,
+                 api_key=None, base_url=None):
+        self.model = model or self.DOUBAO_MODEL
+        _PLACEHOLDER = '在这里填写你的豆包API Key'
+        self.api_key = api_key if api_key and api_key != _PLACEHOLDER else self.DOUBAO_API_KEY
+        self.base_url = base_url or self.DOUBAO_BASE_URL
+        if not self.api_key or self.api_key == _PLACEHOLDER:
+            raise ValueError(
+                '请先在 DoubaoGoalRewarder.DOUBAO_API_KEY 中填写你的豆包 API Key，'
+                '或通过 --doubao_api_key 参数传入'
+            )
         self.images_dir = Path(images_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +113,13 @@ class OllamaGoalRewarder:
         self.current_frame_path = self.output_dir / 'vlm_current_frame.jpg'
         self.target_paths = self._prepare_target_images()
         self.last_result = self._default_result(stage=0, reason='尚未开始检测')
+        self._vlm_future = None
+
+        # 初始化 OpenAI 客户端（豆包兼容 OpenAI API）
+        if OpenAI is not None:
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        else:
+            self._client = None
 
     def _default_result(self, stage=0, reason='未检测'):
         return {
@@ -100,6 +129,17 @@ class OllamaGoalRewarder:
             'reason': reason,
             'raw': ''
         }
+
+    def reset(self):
+        """重置检测状态，在每个新 episode 开始时调用。"""
+        # 等待异步请求完成（最多等 2 秒），避免旧结果污染新 episode
+        if hasattr(self, '_vlm_future') and self._vlm_future is not None:
+            try:
+                self._vlm_future.result(timeout=2.0)
+            except Exception:
+                pass
+            self._vlm_future = None
+        self.last_result = self._default_result(stage=0, reason='新 episode，尚未检测')
 
     def _find_image(self, stage):
         """在 images_dir 下查找指定阶段的目标图片（支持 jpg/png/jpeg/bmp/webp）。"""
@@ -162,14 +202,32 @@ class OllamaGoalRewarder:
             confidence = confidence / 100.0
         return max(0.0, min(1.0, confidence))
 
-    def evaluate(self, frame_rgb, current_stage, episode, step):
-        """评估当前帧是否达到下一个阶段。
+    def _encode_image_base64(self, image_path):
+        """将图片文件编码为 base64 data URL。"""
+        ext = Path(image_path).suffix.lower()
+        mime_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                    '.png': 'image/png', '.bmp': 'image/bmp', '.webp': 'image/webp'}
+        mime = mime_map.get(ext, 'image/jpeg')
+        with open(image_path, 'rb') as f:
+            data = base64.b64encode(f.read()).decode('utf-8')
+        return f'data:{mime};base64,{data}'
+
+    def evaluate(self, frame_rgb, current_stage, episode, step, camera=None,
+                 gripper_open=True, arm_z=None, home_z=None):
+        """异步评估当前帧是否达到下一个阶段（非阻塞）。
+
+        VLM 调用在后台线程执行，主循环不会被阻塞。
+        返回上一次完成的检测结果，当前请求异步提交。
 
         Args:
-            frame_rgb: 当前RGB帧
+            frame_rgb: 当前RGB帧（84x84，仅供参考，VLM 使用高分辨率帧）
             current_stage: 当前已达到的阶段 (0=none, 1=reached, 2=grasped)
             episode: 当前episode编号
             step: 当前全局步数
+            camera: RealSenseCamera 实例，用于捕获高分辨率帧
+            gripper_open: 夹爪是否张开（True=张开）
+            arm_z: 当前机械臂Z坐标
+            home_z: 复位时Z坐标
 
         Returns:
             dict: {'stage', 'is_match', 'confidence', 'reason', 'raw'}
@@ -178,41 +236,85 @@ class OllamaGoalRewarder:
         if current_stage >= 3:
             return self.last_result
 
-        if step % self.check_every_steps != 0:
-            return self.last_result
-
-        if ollama_chat is None:
-            result = self._default_result(stage=current_stage, reason='未安装 ollama Python 包')
+        if OpenAI is None or self._client is None:
+            result = self._default_result(stage=current_stage, reason='未安装 openai Python 包')
             self.last_result = result
             return result
 
-        # 判断下一个未达到的阶段
+        # 每步都检查异步结果是否完成，完成就立即收取（减少延迟）
+        if hasattr(self, '_vlm_future') and self._vlm_future is not None and self._vlm_future.done():
+            try:
+                result = self._vlm_future.result()
+                if result.get('stage', 0) > current_stage + 1:
+                    result = self._default_result(stage=current_stage, reason='旧结果已过期')
+                self.last_result = result
+            except Exception as exc:
+                self.last_result = self._default_result(stage=current_stage, reason=f'VLM 检测失败: {exc}')
+            self._vlm_future = None
+
+        # 只在 check_every_steps 间隔提交新请求
+        if step % self.check_every_steps != 0:
+            return self.last_result
+
+        # 如果上一次异步调用还没完成，跳过本次提交
+        if self._vlm_future is not None and not self._vlm_future.done():
+            return self.last_result
+
+        # 提交新的异步请求：使用高分辨率帧（如果 camera 可用）
         next_stage = current_stage + 1
 
+        # 前置过滤：根据机械臂状态跳过不可能的阶段
+        if next_stage == 2 and gripper_open:
+            # 夹爪张开时不可能夹住物体，跳过VLM调用
+            return self.last_result
+        if next_stage == 3 and home_z is not None and arm_z is not None:
+            # Z轴没有抬高时不可能提起物体（阈值10mm）
+            if arm_z < home_z - 50:
+                return self.last_result
+
         try:
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(self.current_frame_path), frame_bgr)
+            if camera is not None and hasattr(camera, 'capture_full'):
+                hi_res_frame = camera.capture_full()  # 640x480 RGB
+                frame_bgr = cv2.cvtColor(hi_res_frame, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(self.current_frame_path), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        except Exception:
+            return self.last_result
 
+        self._vlm_future = self._submit_async(current_stage, next_stage)
+        return self.last_result
+
+    def _submit_async(self, current_stage, next_stage):
+        """在线程池中异步提交 VLM 请求。"""
+        if not hasattr(self, '_vlm_executor'):
+            self._vlm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        return self._vlm_executor.submit(self._call_vlm, current_stage, next_stage)
+
+    def _call_vlm(self, current_stage, next_stage):
+        """实际执行 VLM API 调用（在后台线程中运行）。"""
+        try:
             prompt = self.STAGE_PROMPTS[next_stage]
+            current_b64 = self._encode_image_base64(str(self.current_frame_path))
 
-            response = ollama_chat(
+            response = self._client.chat.completions.create(
                 model=self.model,
                 messages=[{
                     'role': 'user',
-                    'content': prompt,
-                    'images': [self.target_paths[next_stage], str(self.current_frame_path)]
+                    'content': [
+                        {'type': 'image_url', 'image_url': {'url': current_b64}},
+                        {'type': 'text', 'text': prompt},
+                    ]
                 }],
-                format='json',
-                stream=False,
-                options={'temperature': 0}
+                temperature=0,
             )
 
-            if hasattr(response, 'message'):
-                raw_content = response.message.content
-            else:
-                raw_content = response['message']['content']
+            raw_content = response.choices[0].message.content
 
             parsed = self._extract_json(raw_content)
+            if not parsed:
+                print(f"[VLM] JSON解析失败 | raw={raw_content[:200]}")
+                return self._default_result(stage=current_stage, reason='JSON解析失败')
             is_match = self._coerce_bool(
                 parsed.get('is_match', parsed.get('matched', False))
             )
@@ -221,19 +323,24 @@ class OllamaGoalRewarder:
 
             matched_stage = next_stage if (is_match and confidence >= self.confidence_threshold) else current_stage
 
-            result = {
+            # VLM 调用结果日志
+            if is_match:
+                print(f"[VLM] stage {current_stage}→{next_stage} | match={is_match} "
+                      f"conf={confidence:.2f} → {matched_stage} | reason={reason[:80]}")
+            elif confidence > 0.3:
+                print(f"[VLM] stage {current_stage}→{next_stage} | match={is_match} "
+                      f"conf={confidence:.2f} (低置信度) | reason={reason[:80]}")
+
+            return {
                 'stage': matched_stage,
                 'is_match': is_match,
                 'confidence': confidence,
                 'reason': reason[:120],
                 'raw': raw_content
             }
-            self.last_result = result
-            return result
         except Exception as exc:
-            result = self._default_result(stage=current_stage, reason=f'VLM 检测失败: {exc}')
-            self.last_result = result
-            return result
+            print(f"[VLM] FAILED stage {current_stage}→{next_stage} | error={exc}")
+            return self._default_result(stage=current_stage, reason=f'VLM 检测失败: {exc}')
 
 
 class PiperRobotTrainer:
@@ -349,10 +456,12 @@ class PiperRobotTrainer:
 
         # VLM 自动奖励
         self.use_vlm_reward = False
-        self.ollama_model = 'gemma4'
+        self.doubao_api_key = ''
+        self.doubao_model = 'API'
+        self.doubao_base_url = 'https://ark.cn-beijing.volces.com/api/v3'
         self.images_dir = str(Path(script_dir) / 'images')
-        self.vlm_confidence_threshold = 0.80
-        self.vlm_check_every = 5
+        self.vlm_confidence_threshold = 0.60
+        self.vlm_check_every = 20
         self.vlm_rewarder = None
         self.last_vlm_result = None
 
@@ -435,18 +544,20 @@ class PiperRobotTrainer:
         # VLM 自动奖励初始化
         if self.use_vlm_reward:
             try:
-                self.vlm_rewarder = OllamaGoalRewarder(
-                    model=self.ollama_model,
+                self.vlm_rewarder = DoubaoGoalRewarder(
+                    model=self.doubao_model,
                     images_dir=self.images_dir,
                     output_dir=self.output_dir,
                     confidence_threshold=self.vlm_confidence_threshold,
                     check_every_steps=self.vlm_check_every,
+                    api_key=self.doubao_api_key or None,
+                    base_url=self.doubao_base_url or None,
                 )
                 self.last_vlm_result = self.vlm_rewarder.last_result
-                print(f"✅ VLM 自动奖励已启用 | model={self.ollama_model}")
+                print(f"✅ VLM 自动奖励已启用 | model={self.doubao_model}")
                 print(f"✅ 目标图片目录: {self.vlm_rewarder.images_dir.resolve()}")
                 for stage, path in self.vlm_rewarder.target_paths.items():
-                    print(f"   阶段{stage}({OllamaGoalRewarder.STAGE_NAMES[stage]}): {Path(path).name}")
+                    print(f"   阶段{stage}({DoubaoGoalRewarder.STAGE_NAMES[stage]}): {Path(path).name}")
             except Exception as e:
                 print(f"⚠️  VLM 自动奖励初始化失败: {e}")
                 self.use_vlm_reward = False
@@ -831,7 +942,11 @@ class PiperRobotTrainer:
         # VLM 自动检测（在按键处理之前）
         if self.vlm_rewarder is not None:
             self.last_vlm_result = self.vlm_rewarder.evaluate(
-                frame, self.current_stage, self._global_episode, self._global_step
+                frame, self.current_stage, self._global_episode, self._global_step,
+                camera=self.camera,
+                gripper_open=self.gripper_open,
+                arm_z=self.Z,
+                home_z=self.HOME_Z,
             )
             vlm_matched_stage = self.last_vlm_result.get('stage', self.current_stage)
             if vlm_matched_stage > self.current_stage:
@@ -839,7 +954,7 @@ class PiperRobotTrainer:
                 for s in range(self.current_stage + 1, vlm_matched_stage + 1):
                     self.current_stage = s
                     self._reward += self.STAGE_REWARDS[s]
-                stage_name = OllamaGoalRewarder.STAGE_NAMES.get(vlm_matched_stage, '?')
+                stage_name = DoubaoGoalRewarder.STAGE_NAMES.get(vlm_matched_stage, '?')
                 print(
                     f"[VLM自动奖励] Ep{self._global_episode+1} Step{self._global_step} | "
                     f"stage {vlm_matched_stage}({stage_name}) +{self.STAGE_REWARDS[vlm_matched_stage]:.0f} | "
@@ -923,6 +1038,11 @@ class PiperRobotTrainer:
                 self.episode_step = 0
                 self.episode_reward = 0.0
                 self.current_stage = 0
+
+                # 重置 VLM 检测状态，避免上一 episode 结果污染
+                if self.vlm_rewarder is not None:
+                    self.vlm_rewarder.reset()
+                    self.last_vlm_result = self.vlm_rewarder.last_result
 
                 # 复位
                 self.X, self.Y, self.Z = self.HOME_X, self.HOME_Y, self.HOME_Z
@@ -1104,12 +1224,14 @@ def main():
     parser.add_argument('--async_interval', type=float, default=0.01, help='异步更新间隔(秒)')
     parser.add_argument('--negative_ratio', type=float, default=0.2, help='RL阶段负样本采样比例(0=不采样负样本)')
     # VLM 自动奖励
-    parser.add_argument('--use_vlm_reward', action='store_true', help='启用基于 Ollama VLM 的自动奖励')
-    parser.add_argument('--ollama_model', type=str, default='gemma4', help='Ollama 模型名，默认 gemma4')
+    parser.add_argument('--use_vlm_reward', action='store_true', help='启用基于豆包 VLM 的自动奖励')
+    parser.add_argument('--doubao_api_key', type=str, default='', help='豆包 API Key')
+    parser.add_argument('--doubao_model', type=str, default='ep-20260606175321-9sh48', help='豆包模型名')
+    parser.add_argument('--doubao_base_url', type=str, default='https://ark.cn-beijing.volces.com/api/v3', help='豆包 API Base URL')
     parser.add_argument('--images_dir', type=str, default=str(Path(script_dir) / 'images'),
                         help='三阶段目标图片目录，默认 images/，需包含 target_reached.jpg, target_grasped.jpg, target_lifted.jpg')
-    parser.add_argument('--vlm_confidence_threshold', type=float, default=0.80, help='VLM 判定成功所需的最小置信度')
-    parser.add_argument('--vlm_check_every', type=int, default=5, help='每隔多少步调用一次 VLM 判定，默认每5步')
+    parser.add_argument('--vlm_confidence_threshold', type=float, default=0.60, help='VLM 判定成功所需的最小置信度')
+    parser.add_argument('--vlm_check_every', type=int, default=20, help='每隔多少步调用一次 VLM 判定，默认每20步')
 
     args = parser.parse_args()
 
@@ -1122,7 +1244,9 @@ def main():
     trainer.async_update_interval = args.async_interval
     # VLM 自动奖励参数
     trainer.use_vlm_reward = args.use_vlm_reward
-    trainer.ollama_model = args.ollama_model
+    trainer.doubao_api_key = args.doubao_api_key
+    trainer.doubao_model = args.doubao_model
+    trainer.doubao_base_url = args.doubao_base_url
     trainer.images_dir = args.images_dir
     trainer.vlm_confidence_threshold = args.vlm_confidence_threshold
     trainer.vlm_check_every = args.vlm_check_every
