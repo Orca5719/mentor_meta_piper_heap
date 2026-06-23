@@ -31,7 +31,7 @@ real:
   # Hand-eye calibration file (run calibration script first)
   calibration_file: null       # e.g., "calibration.npy"
 
-  # Manual reward: 1=reached(+1), 2=grasped(+3), 3=lifted(+6), Q=e-stop
+  # Manual reward: 1=reached(+4), 2=grasped(+1), 3=aligned(+4), 4=placed(+1), Q=e-stop
   manual_reward: true
 
 # Override training params for real robot
