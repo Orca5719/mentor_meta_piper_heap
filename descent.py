@@ -64,7 +64,7 @@ class DoubaoGoalRewarder:
     """
 
     # ========== 在这里填写豆包 API Key ==========
-    DOUBAO_API_KEY = 'ark-83458e07-1bbb-4535-be7f-bb811b611b20-a056d'
+    DOUBAO_API_KEY = 'API'
     # ============================================
 
     DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
