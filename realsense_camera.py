@@ -92,6 +92,18 @@ class RealSenseCamera:
         Returns:
             np.ndarray of shape (target_h, target_w, 3), dtype uint8, RGB order
         """
+        return self._capture_resized(self._target_size)
+
+    def capture_full(self) -> np.ndarray:
+        """Capture a single color frame at full sensor resolution (no resize).
+
+        Returns:
+            np.ndarray of shape (h, w, 3), dtype uint8, RGB order
+        """
+        return self._capture_resized(None)
+
+    def _capture_resized(self, target_size) -> np.ndarray:
+        """Internal: capture a color frame, optionally resized."""
         assert self._connected, "Camera not connected. Call connect() first."
         frames = self._pipeline.wait_for_frames()
 
@@ -100,7 +112,9 @@ class RealSenseCamera:
 
         color_frame = frames.get_color_frame()
         if not color_frame:
-            return np.zeros(self._target_size + (3,), dtype=np.uint8)
+            if target_size is None:
+                return np.zeros((480, 640, 3), dtype=np.uint8)
+            return np.zeros(target_size + (3,), dtype=np.uint8)
 
         color_img = np.asanyarray(color_frame.get_data())  # BGR, uint8
 
@@ -112,8 +126,9 @@ class RealSenseCamera:
             x0 = (w - cw) // 2
             color_img = color_img[y0:y0+ch, x0:x0+cw]
 
-        # Resize to target
-        color_img = cv2.resize(color_img, self._target_size)
+        # Resize to target (if specified)
+        if target_size is not None:
+            color_img = cv2.resize(color_img, target_size)
 
         # BGR → RGB
         color_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2RGB)
