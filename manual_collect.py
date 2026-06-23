@@ -85,8 +85,8 @@ class SimpleSpacemouseCollect:
         self.control_sleep = 0.01
 
         # Staged reward
-        self.STAGE_REWARDS = {1: 6.0, 2: 3.0, 3: 1.0}
-        self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
+        self.STAGE_REWARDS = {1: 4.0, 2: 1.0, 3: 4.0, 4: 1.0}
+        self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "aligned", 4: "placed"}
         self.current_stage = 0
 
     def _init_specs(self):
@@ -378,8 +378,12 @@ class SimpleSpacemouseCollect:
                 elif key == ord('3') and self.current_stage < 3:
                     self.current_stage = 3
                     current_reward = self.STAGE_REWARDS[3]
-                    self.end = True  # 提起 = 成功, 结束episode
-                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | 提起 +{current_reward} ★")
+                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | 对齐 +{current_reward}")
+                elif key == ord('4') and self.current_stage < 4:
+                    self.current_stage = 4
+                    current_reward = self.STAGE_REWARDS[4]
+                    self.end = True  # 放置完成 = 成功, 结束episode
+                    print(f"[奖励] Ep{self.episode+1} Step{self.episode_step} | 放置 +{current_reward} ★")
                 elif key == ord('q'):
                     print("\n用户终止收集，正在保存数据...")
                     self._running = False

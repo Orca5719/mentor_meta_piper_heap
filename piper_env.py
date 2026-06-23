@@ -42,19 +42,20 @@ except ImportError:
 class KeyboardRewardListener:
     """Background thread that listens for staged manual reward.
 
-    Staged reward scheme (631):
-      Key 1 → "到达" (reached):  reward +6.0,  stage=1
-      Key 2 → "抓住" (grasped):  reward +3.0,  stage=2
-      Key 3 → "提起" (lifted):   reward +1.0,  stage=3, success=True
+    Staged reward scheme (stacking):
+      Key 1 → "到达" (reached):  reward +4.0,  stage=1
+      Key 2 → "抓住" (grasped):  reward +1.0,  stage=2
+      Key 3 → "对齐" (aligned):  reward +4.0,  stage=3
+      Key 4 → "放置" (placed):   reward +1.0,  stage=4, success=True
       Key Q → emergency stop
 
-    Total max reward per episode = 6.0 + 3.0 + 1.0 = 10.0.
+    Total max reward per episode = 4.0 + 3.0 + 2.0 + 1.0 = 10.0.
     Stages are progressive: pressing a later key implicitly advances the stage.
     """
 
     # Staged reward constants
-    STAGE_REWARDS = {1: 6.0, 2: 3.0, 3: 1.0}
-    STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
+    STAGE_REWARDS = {1: 4.0, 2: 1.0, 3: 4.0, 4: 1.0}
+    STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "aligned", 4: "placed"}
 
     def __init__(self):
         self._reward_pending = 0.0
@@ -71,7 +72,7 @@ class KeyboardRewardListener:
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
         print("[KeyboardReward] Listener started. "
-              "1=reached(+6), 2=grasped(+3), 3=lifted(+1), Q=e-stop")
+              "1=reached(+4), 2=grasped(+1), 3=aligned(+4), 4=placed(+1), Q=e-stop")
 
     def stop(self):
         """Stop the keyboard listener."""
@@ -112,7 +113,7 @@ class KeyboardRewardListener:
             self._current_stage = stage
             reward = self.STAGE_REWARDS[stage]
             self._reward_pending += reward
-            success = (stage == 3)
+            success = (stage == 4)
             self._success_pending = self._success_pending or success
             print(f"[KeyboardReward] Stage {stage}: {self.STAGE_NAMES[stage]} | +{reward:.1f}"
                   + (" ★ SUCCESS!" if success else ""))
@@ -141,6 +142,8 @@ class KeyboardRewardListener:
                         self._advance_stage(2)
                     elif ch == b'3':
                         self._advance_stage(3)
+                    elif ch == b'4':
+                        self._advance_stage(4)
                     elif ch.lower() == b'q':
                         self._set_estop()
                         print("[KeyboardReward] *** E-STOP triggered ***")
@@ -162,6 +165,8 @@ class KeyboardRewardListener:
                         self._advance_stage(2)
                     elif ch == '3':
                         self._advance_stage(3)
+                    elif ch == '4':
+                        self._advance_stage(4)
                     elif ch.lower() == 'q':
                         self._set_estop()
                         print("[KeyboardReward] *** E-STOP triggered ***")
@@ -446,7 +451,7 @@ class PiperEnv:
                     [dx, dy, dz, gripper] all in [-1, 1]
 
         Reward and success are provided by the human operator:
-          Key 1 = reached (+6.0), Key 2 = grasped (+3.0), Key 3 = lifted (+1.0).
+          Key 1 = reached (+4.0), Key 2 = grasped (+1.0), Key 3 = aligned (+4.0), Key 4 = placed (+1.0).
         """
         action = action["action"]
         assert action.shape == (4,), f"Expected action shape (4,), got {action.shape}"

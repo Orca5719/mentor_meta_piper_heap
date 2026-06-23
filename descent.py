@@ -54,42 +54,49 @@ class TimeStep(_TimeStepBase):
 class DoubaoGoalRewarder:
     """基于豆包 VLM 的分段自动目标检测奖励器。
 
-    支持三阶段判定（reached/grasped/lifted），每个阶段对应一张目标图片。
+    支持四阶段判定（reached/grasped/aligned/placed），每个阶段对应一张目标图片。
     VLM 只判断当前尚未达到的下一阶段，匹配则推进阶段并触发对应分段奖励。
 
     目标图片默认存放在 images/ 目录下：
-        images/target_reached.jpg  — 阶段1: 机械臂到达物体附近
-        images/target_grasped.jpg  — 阶段2: 机械臂抓住物体
-        images/target_lifted.jpg   — 阶段3: 机械臂提起物体
+        images/target_reached.jpg  — 阶段1: 机械臂到达"要抓的方块"附近
+        images/target_grasped.jpg  — 阶段2: 机械臂抓住"要抓的方块"
+        images/target_aligned.jpg  — 阶段3: "要抓的方块"对齐到"目标方块"正上方
+        images/target_placed.jpg   — 阶段4: "要抓的方块"放置在"目标方块"顶部
     """
 
     # ========== 在这里填写豆包 API Key ==========
-    DOUBAO_API_KEY = 'API'
+    DOUBAO_API_KEY = 'ark-83458e07-1bbb-4535-be7f-bb811b611b20-a056d'
     # ============================================
 
     DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
     DOUBAO_MODEL = 'ep-20260606175321-9sh48'
 
-    STAGE_NAMES = {1: 'reached', 2: 'grasped', 3: 'lifted'}
+    STAGE_NAMES = {1: 'reached', 2: 'grasped', 3: 'aligned', 4: 'placed'}
     STAGE_PROMPTS = {
-        1: '你正在观察一个机械臂操作的实时画面。'
-           '请判断当前画面中，机械臂夹爪是否已经接近桌面上的物体（红色方块）。'
-           '判断标准：夹爪末端与物体之间的距离是否已经很近（夹爪在物体正上方或旁边），不需要抓住。'
-           '注意：物体在桌面上的位置不固定，只需关注夹爪与物体的相对距离。'
-           '如果夹爪已接近物体，is_match=true，否则为 false。'
+        1: '你正在观察一个机械臂操作的实时画面。桌面上有两个方块：一个是"要抓的方块"，另一个是"目标方块"（作为堆叠底座）。'
+           '请判断当前画面中，机械臂夹爪是否已经接近"要抓的方块"。'
+           '判断标准：夹爪末端与"要抓的方块"之间的距离是否已经很近（夹爪在"要抓的方块"正上方或旁边），不需要抓住。'
+           '注意：方块在桌面上的位置不固定，只需关注夹爪与"要抓的方块"的相对距离，不要关注"目标方块"。'
+           '如果夹爪已接近"要抓的方块"，is_match=true，否则为 false。'
            '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
-        2: '你正在观察一个机械臂操作的实时画面。'
-           '请判断当前画面中，机械臂夹爪是否已经夹住物体（红色方块）。'
-           '关键判断标准：夹爪的两个指是否已经闭合，且物体（红色方块）被夹在两个指之间。'
+        2: '你正在观察一个机械臂操作的实时画面。桌面上有两个方块：一个是"要抓的方块"，另一个是"目标方块"（作为堆叠底座）。'
+           '请判断当前画面中，机械臂夹爪是否已经夹住"要抓的方块"。'
+           '关键判断标准：夹爪的两个指是否已经闭合，且"要抓的方块"被夹在两个指之间。'
            '与"仅接近"的区别："接近"时夹爪是张开的（两指之间有明显间距），"夹住"时夹爪两指已合拢，物体被卡在中间。'
            '请仔细观察夹爪两指之间的间距：如果间距大、物体在夹爪外面，说明只是接近未夹住；如果间距小、物体在两指之间，说明已夹住。'
-           '如果夹爪已闭合且物体在两指之间，is_match=true，否则为 false。'
+           '如果夹爪已闭合且"要抓的方块"在两指之间，is_match=true，否则为 false。'
            '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
-        3: '你正在观察一个机械臂操作的实时画面。'
-           '请判断当前画面中，机械臂是否已经成功提起物体（红色方块）离开桌面。'
-           '判断标准：物体是否已经离开桌面，被夹爪悬空持住。'
-           '注意：物体被提起后的位置不固定，只需关注物体是否离开桌面。'
-           '如果物体已离开桌面并被夹持悬空，is_match=true，否则为 false。'
+        3: '你正在观察一个机械臂操作的实时画面。桌面上有两个方块：机械臂夹爪已经夹住了"要抓的方块"，另一个是"目标方块"（作为堆叠底座，仍在桌面上）。'
+           '请判断当前画面中，机械臂夹住的"要抓的方块"是否已经移动到"目标方块"的正上方（水平方向对齐）。'
+           '判断标准：从画面上看，"要抓的方块"是否位于"目标方块"的正上方，两者在水平（X/Y）方向基本对齐。'
+           '此时"要抓的方块"的高度（离桌面多高）不重要，只要它在"目标方块"正上方即可。'
+           '注意：方块在桌面上的位置不固定，只需关注"要抓的方块"与"目标方块"的水平相对位置。'
+           '如果"要抓的方块"已在"目标方块"正上方（水平对齐），is_match=true，否则为 false。'
+           '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
+        4: '你正在观察一个机械臂操作的实时画面。桌面上有两个方块："要抓的方块"和"目标方块"（作为堆叠底座）。'
+           '请判断当前画面中，"要抓的方块"是否已经被成功放置在"目标方块"的顶部（堆叠完成），且机械臂夹爪已经松开。'
+           '判断标准：（1）"要抓的方块"稳稳落在"目标方块"的正上方顶部，两个方块上下叠放；（2）夹爪已经张开，不再夹持"要抓的方块"。'
+           '如果"要抓的方块"已放在"目标方块"顶部且夹爪已松开，is_match=true，否则为 false。'
            '必须只输出 JSON: {"is_match": true/false, "confidence": 0.0-1.0, "reason": "简短中文原因"}',
     }
 
@@ -151,10 +158,10 @@ class DoubaoGoalRewarder:
         return None
 
     def _prepare_target_images(self):
-        """加载并复制三阶段目标图片到输出目录。"""
+        """加载并复制四阶段目标图片到输出目录。"""
         paths = {}
         missing = []
-        for stage in [1, 2, 3]:
+        for stage in [1, 2, 3, 4]:
             src = self._find_image(stage)
             if src is None:
                 missing.append(f'target_{self.STAGE_NAMES[stage]}.jpg')
@@ -221,7 +228,7 @@ class DoubaoGoalRewarder:
 
         Args:
             frame_rgb: 当前RGB帧（84x84，仅供参考，VLM 使用高分辨率帧）
-            current_stage: 当前已达到的阶段 (0=none, 1=reached, 2=grasped)
+            current_stage: 当前已达到的阶段 (0=none, 1=reached, 2=grasped, 3=aligned)
             episode: 当前episode编号
             step: 当前全局步数
             camera: RealSenseCamera 实例，用于捕获高分辨率帧
@@ -231,9 +238,9 @@ class DoubaoGoalRewarder:
 
         Returns:
             dict: {'stage', 'is_match', 'confidence', 'reason', 'raw'}
-                  stage=匹配的阶段编号(1/2/3)，未匹配时等于current_stage
+                  stage=匹配的阶段编号(1/2/3/4)，未匹配时等于current_stage
         """
-        if current_stage >= 3:
+        if current_stage >= 4:
             return self.last_result
 
         if OpenAI is None or self._client is None:
@@ -267,10 +274,12 @@ class DoubaoGoalRewarder:
         if next_stage == 2 and gripper_open:
             # 夹爪张开时不可能夹住物体，跳过VLM调用
             return self.last_result
-        if next_stage == 3 and home_z is not None and arm_z is not None:
-            # Z轴没有抬高时不可能提起物体（阈值10mm）
-            if arm_z < home_z - 50:
-                return self.last_result
+        if next_stage == 3 and gripper_open:
+            # 夹爪张开说明尚未夹住方块，不可能进行对齐，跳过VLM调用
+            return self.last_result
+        if next_stage == 4 and not gripper_open:
+            # 夹爪仍未张开（未松开方块），不可能完成放置，跳过VLM调用
+            return self.last_result
 
         try:
             if camera is not None and hasattr(camera, 'capture_full'):
@@ -421,8 +430,8 @@ class PiperRobotTrainer:
         self.is_intervening = False
 
         # Staged reward
-        self.STAGE_REWARDS = {1: 6.0, 2: 3.0, 3: 1.0}
-        self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "lifted"}
+        self.STAGE_REWARDS = {1: 4.0, 2: 1.0, 3: 4.0, 4: 1.0}
+        self.STAGE_NAMES = {0: "none", 1: "reached", 2: "grasped", 3: "aligned", 4: "placed"}
         self.current_stage = 0
 
         # 夹爪
@@ -457,7 +466,7 @@ class PiperRobotTrainer:
         # VLM 自动奖励
         self.use_vlm_reward = False
         self.doubao_api_key = ''
-        self.doubao_model = 'API'
+        self.doubao_model = 'ep-20260606175321-9sh48'
         self.doubao_base_url = 'https://ark.cn-beijing.volces.com/api/v3'
         self.images_dir = str(Path(script_dir) / 'images')
         self.vlm_confidence_threshold = 0.60
@@ -934,7 +943,7 @@ class PiperRobotTrainer:
                        cv2.FONT_HERSHEY_SIMPLEX, font_small, (180, 220, 255), thin)
             y_pos += line_spacing
 
-        cv2.putText(frame_bgr, "1=reached 2=grasped 3=lifted s=Save q=Quit", (10, y_pos),
+        cv2.putText(frame_bgr, "1=reach 2=grasp 3=align 4=place s=Save q=Quit", (10, y_pos),
                    cv2.FONT_HERSHEY_SIMPLEX, font_small, (0, 200, 255), thin)
 
         cv2.imshow("Piper Robot Training", frame_bgr)
@@ -973,6 +982,9 @@ class PiperRobotTrainer:
         elif key == ord('3') and self.current_stage < 3:
             self.current_stage = 3
             self._reward += self.STAGE_REWARDS[3]
+        elif key == ord('4') and self.current_stage < 4:
+            self.current_stage = 4
+            self._reward += self.STAGE_REWARDS[4]
         elif key == ord('s'):
             self.save_snapshot()
         elif key == ord('q'):
@@ -1143,8 +1155,8 @@ class PiperRobotTrainer:
                         'Intervene': self.is_intervening
                     })
 
-                    # 按3(提起)后提前结束episode
-                    if self.current_stage >= 3:
+                    # 按4(放置完成)后提前结束episode
+                    if self.current_stage >= 4:
                         break
 
                 step_bar.close()
@@ -1229,7 +1241,7 @@ def main():
     parser.add_argument('--doubao_model', type=str, default='ep-20260606175321-9sh48', help='豆包模型名')
     parser.add_argument('--doubao_base_url', type=str, default='https://ark.cn-beijing.volces.com/api/v3', help='豆包 API Base URL')
     parser.add_argument('--images_dir', type=str, default=str(Path(script_dir) / 'images'),
-                        help='三阶段目标图片目录，默认 images/，需包含 target_reached.jpg, target_grasped.jpg, target_lifted.jpg')
+                        help='四阶段目标图片目录，默认 images/，需包含 target_reached.jpg, target_grasped.jpg, target_aligned.jpg, target_placed.jpg')
     parser.add_argument('--vlm_confidence_threshold', type=float, default=0.60, help='VLM 判定成功所需的最小置信度')
     parser.add_argument('--vlm_check_every', type=int, default=20, help='每隔多少步调用一次 VLM 判定，默认每20步')
 
