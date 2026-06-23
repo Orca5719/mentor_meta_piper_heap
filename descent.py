@@ -889,15 +889,18 @@ class PiperRobotTrainer:
         frame = self._latest_frame.copy()
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-        # 根据图像尺寸自适应字号
-        scale = min(self.IMG_HEIGHT, self.IMG_WIDTH) / 256.0
-        y_pos = int(25 * scale)
-        line_spacing = int(20 * scale)
-        font_title = max(0.5, 0.7 * scale)
-        font_body = max(0.35, 0.5 * scale)
-        font_small = max(0.3, 0.4 * scale)
-        thick = max(1, int(2 * scale))
-        thin = max(1, int(1 * scale))
+        # 放大显示帧（从 84x84 → 480x480），避免文字糊成一团
+        display_size = 480
+        frame_bgr = cv2.resize(frame_bgr, (display_size, display_size), interpolation=cv2.INTER_NEAREST)
+
+        # 固定字号（基于放大后的尺寸）
+        y_pos = 28
+        line_spacing = 24
+        font_title = 0.7
+        font_body = 0.55
+        font_small = 0.45
+        thick = 2
+        thin = 1
 
         if self._global_step < self.seed_steps:
             cv2.putText(frame_bgr, "SEEDING...", (10, y_pos),
@@ -1226,7 +1229,7 @@ def main():
     parser = argparse.ArgumentParser(description='Piper 机械臂实时训练 (兼容 mentor piper_env)')
     parser.add_argument('--snapshot', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--episodes', type=int, default=1000, help='训练 episode 数量')
-    parser.add_argument('--steps', type=int, default=1500, help='每个 episode 最大步数')
+    parser.add_argument('--steps', type=int, default=3000, help='每个 episode 最大步数')
     parser.add_argument('--bc_steps', type=int, default=10000, help='BC预训练步数 (0=不预训练)')
     parser.add_argument('--bc_loss', type=str, default='mse', choices=['mse', 'nll'], help='BC损失类型')
     parser.add_argument('--demo_ratio_start', type=float, default=1.0, help='Demo采样初始比例')
