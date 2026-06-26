@@ -366,7 +366,7 @@ class PiperRobotTrainer:
         self.batch_size = 256
         self.update_every_episodes = 5
         self.save_interval = 1000
-        self.seed_steps = 1000
+        self.seed_steps = 3000
 
         self.camera = None
         self.piper_arm = None
@@ -1230,7 +1230,7 @@ def main():
     parser.add_argument('--snapshot', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--episodes', type=int, default=1000, help='训练 episode 数量')
     parser.add_argument('--steps', type=int, default=3000, help='每个 episode 最大步数')
-    parser.add_argument('--bc_steps', type=int, default=10000, help='BC预训练步数 (0=不预训练)')
+    parser.add_argument('--bc_steps', type=int, default=15000, help='BC预训练步数 (0=不预训练)')
     parser.add_argument('--bc_loss', type=str, default='mse', choices=['mse', 'nll'], help='BC损失类型')
     parser.add_argument('--demo_ratio_start', type=float, default=1.0, help='Demo采样初始比例')
     parser.add_argument('--demo_ratio_end', type=float, default=0.3, help='Demo采样最终比例')
